@@ -61,7 +61,7 @@ class AgentState(TypedDict):
     messages: Annotated[List[Union[AIMessage, HumanMessage, ToolMessage, SystemMessage]], operator.add]
     intermediate_steps: List[tuple]
     retrieved_documents: Optional[List[Document]]
-    query_analysis: Optional[Dict[str, Any]]
+    query_analysis: Dict[str, Any]
 
 def initialize_search_tools():
     """검색 도구 초기화"""
@@ -159,11 +159,10 @@ def query_analysis_node(state: AgentState) -> dict:
         다음 질문을 분석하여 JSON 형식으로 다음 정보를 제공하세요:
         1. query_type: 질문의 유형 (factual, analysis, opinion, technical, scholarly)
         2. domains: 관련된 지식 도메인 목록 (최대 3개)
-        3. requires_rag: 내부 지식베이스 검색이 필요한지 (true/false)
-        4. requires_web_search: 웹 검색이 필요한지 (true/false)
-        5. requires_scholar_search: 학술 검색이 필요한지 (true/false)
-        6. search_query: 검색에 적합한 질의어 (있는 경우)
-        7. complexity: 질문의 복잡성 (simple, moderate, complex)
+        3. requires_web_search: 웹 검색이 필요한지 (true/false)
+        4. requires_scholar_search: 학술 검색이 필요한지 (true/false)
+        5. search_query: 검색에 적합한 질의어 (있는 경우)
+        6. complexity: 질문의 복잡성 (simple, moderate, complex)
         """),
         ("user", f"다음 질문을 분석해주세요: {user_message}")
     ])
@@ -175,6 +174,8 @@ def query_analysis_node(state: AgentState) -> dict:
     # JSON 파싱 (오류 처리 포함)
     try:
         query_analysis = json.loads(analysis_result)
+        # 항상 RAG 검색 활성화
+        query_analysis["requires_rag"] = True
     except json.JSONDecodeError:
         # 파싱 오류 시 기본값 사용
         query_analysis = {
@@ -196,8 +197,13 @@ def query_analysis_node(state: AgentState) -> dict:
 # 라우터 노드: 질문 유형에 따라 처리 경로 결정
 def router_node(state: AgentState) -> dict:
     logger.info("--- 라우터 노드 실행 ---")
-    query_analysis = state.get("query_analysis", {})
+    query_analysis = state.get("query_analysis")
+    if not query_analysis:
+        raise ValueError("query_analysis가 없습니다. 쿼리 분석 노드가 정상적으로 작동하지 않았을 수 있습니다.")
+    
     query_type = query_analysis.get("query_type", "factual")
+    logger.info(f"쿼리 유형: {query_type}")
+    
     # 현재는 모든 유형을 rag_retrieval_node로 라우팅
     return {"route": "rag_retrieval_node"}  # LangGraph 표준 형식: {"route": 노드이름}
 
@@ -214,9 +220,19 @@ def rag_retrieval_node(state: AgentState) -> dict:
         logger.info(f"벡터 스토어 디렉토리 생성됨: {vector_store_dir}")
         return {"retrieved_documents": []}
     
-    # 기존 벡터 저장소 연결 또는 생성
+    # OpenAI API 키 확인
+    if not OPENAI_API_KEY:
+        logger.error("OpenAI API 키가 설정되지 않았습니다.")
+        return {"retrieved_documents": []}
+    
+    # 임베딩 객체 생성 확인
     try:
-        vector_store = Chroma(persist_directory=vector_store_dir, embedding_function=embeddings)
+        # 임베딩 객체 확인 및 재생성
+        local_embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        logger.info("임베딩 객체 생성 성공")
+        
+        # 기존 벡터 저장소 연결 또는 생성
+        vector_store = Chroma(persist_directory=vector_store_dir, embedding_function=local_embeddings)
         doc_count = vector_store._collection.count()
         logger.info(f"기존 벡터 DB 연결 성공: 문서 수 = {doc_count}")
         
@@ -233,11 +249,6 @@ def rag_retrieval_node(state: AgentState) -> dict:
     
     # 쿼리 분석 결과 가져오기
     query_analysis = state.get("query_analysis", {})
-    
-    # RAG 검색이 필요한 경우만 실행
-    if not query_analysis.get("requires_rag", True):
-        logger.info("쿼리 분석 결과 RAG가 필요하지 않음")
-        return {"retrieved_documents": []}
     
     # 검색 결과 수 설정
     retrieval_count = CONFIG.get("retrieval_count", 4)
@@ -283,6 +294,8 @@ def agent_node(state: AgentState) -> dict:
         위 문서 내용을 바탕으로 질문에 답변하되, 문서에 없는 내용은 자신의 지식을 활용하세요.
         내부 문서를 인용할 때는 '내부 문서 X에 따르면'과 같은 형식으로 언급하세요.
         답변은 한국어로 제공하세요.
+        
+        질문에 대한 답변이 문서에 없거나 불완전하다면, 자동으로 웹 검색 도구를 사용하여 추가 정보를 찾아보세요.
         """)
         
         # 시스템 메시지 추가
@@ -308,6 +321,8 @@ def agent_node(state: AgentState) -> dict:
         당신은 정확하고 도움이 되는 AI 어시스턴트입니다. 
         사용자의 질문에 명확하게 답변하세요.
         답변은 한국어로 제공하세요.
+        
+        질문에 대한 정보가 필요하다면, 자동으로 웹 검색 도구를 사용하여 정보를 찾아보세요.
         """)
         
         # 시스템 메시지 추가
@@ -325,13 +340,18 @@ def agent_node(state: AgentState) -> dict:
         if not system_message_exists:
             updated_messages = [system_message] + updated_messages
     
-    # 쿼리 유형에 따라 웹 검색 도구 사용 여부 결정
-    if tools and (query_analysis.get("requires_web_search", False) or query_analysis.get("requires_scholar_search", False)):
-        logger.info("웹 검색 도구 사용하여 모델 호출")
+    # 항상 도구를 사용하도록 설정하고, 학술 검색이 필요한 경우와 일반 검색이 필요한 경우를 구분
+    if tools:
+        if query_analysis.get("requires_scholar_search", False):
+            logger.info("학술 검색 도구 사용하여 모델 호출")
+        else:
+            logger.info("일반 웹 검색 도구 사용하여 모델 호출")
+        
+        # 항상 도구가 있는 모델 사용
         response = model_with_tools.invoke(updated_messages)
     else:
-        # 웹 검색이 필요 없는 경우 도구 없이 호출
-        logger.info("도구 없이 모델 호출")
+        # 도구가 없는 경우 (도구 초기화 실패 등)
+        logger.info("도구 없이 모델 호출 (도구가 초기화되지 않았음)")
         response = model.invoke(updated_messages)
 
     # tool_calls가 None이면 빈 리스트로 보정 (근본적 해결)
@@ -347,12 +367,27 @@ def tool_node(state: AgentState) -> dict:
     last_message = state["messages"][-1]
     tool_results = []
     
+    # tool_calls가 None인 경우 처리
+    if not hasattr(last_message, "tool_calls") or last_message.tool_calls is None:
+        logger.warning("tool_calls가 없거나 None입니다. 도구 호출 없이 계속합니다.")
+        return {"messages": []}
+    
     for tool_call in last_message.tool_calls:
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
+        tool_name = tool_call.get("name")
+        tool_args = tool_call.get("args", {})
         tool_id = tool_call.get("id", "unknown")
+        
+        if not tool_name or not tool_args:
+            logger.warning(f"tool_call에 필요한 정보가 없습니다: {tool_call}")
+            continue
+            
         try:
             if tool_name in ["google_search", "google_scholar_search"]:
+                # 검색 쿼리 확인
+                query = tool_args.get("query")
+                if not query:
+                    logger.warning(f"tool_args에 query가 없습니다: {tool_args}")
+                    continue
                 # 도구 선택
                 tool = next((t for t in tools if t.name == tool_name), None)
                 if tool:
@@ -388,11 +423,25 @@ def tool_node(state: AgentState) -> dict:
 def should_continue(state: AgentState) -> str:
     logger.info("--- 조건부 엣지 평가 ---")
     last_message = state["messages"][-1]
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        logger.info("결정: 도구 사용 필요")
-        return "tool_node"
-    logger.info("결정: 최종 응답 (종료)")
-    return END
+    
+    # AIMessage인지 확인
+    if not isinstance(last_message, AIMessage):
+        logger.info("결정: 마지막 메시지가 AI 메시지가 아님 (종료)")
+        return END
+    
+    # tool_calls 속성이 있는지 확인
+    if not hasattr(last_message, "tool_calls"):
+        logger.info("결정: tool_calls 속성이 없음 (종료)")
+        return END
+    
+    # tool_calls가 None이 아니고 존재하는지 확인
+    if last_message.tool_calls is None or len(last_message.tool_calls) == 0:
+        logger.info("결정: tool_calls가 없거나 비어 있음 (종료)")
+        return END
+    
+    # 도구 호출이 있으므로 tool_node로 라우팅
+    logger.info(f"결정: 도구 사용 필요 (tool_calls 개수: {len(last_message.tool_calls)})")
+    return "tool_node"
 
 # 그래프 정의 및 컴파일
 def build_rag_agent_graph():
@@ -447,8 +496,8 @@ if __name__ == "__main__":
         initial_state = {
             "messages": [HumanMessage(content=user_query)],
             "intermediate_steps": [],
-            "retrieved_documents": None,
-            "query_analysis": None
+            "retrieved_documents": [],  # None 대신 빈 리스트로 초기화
+            "query_analysis": {}        # None 대신 빈 딕셔너리로 초기화
         }
         
         # 그래프 실행

@@ -151,8 +151,8 @@ def router_node(state: AgentState) -> dict:
     print("--- 라우터 노드 실행 ---")
     query_analysis = state.get("query_analysis", {})
     query_type = query_analysis.get("query_type", "factual")
-    # 현재는 모든 유형을 rag_retrieval로 라우팅, 확장 가능
-    return {"next": "rag_retrieval"}
+    # 현재는 모든 유형을 rag_retrieval_node로 라우팅
+    return {"route": "rag_retrieval"}  # "next" 대신 "route" 키 사용
 
 # 2. RAG 검색 노드: 벡터 저장소에서 관련 문서 검색
 def rag_retrieval_node(state: AgentState) -> dict:
@@ -368,14 +368,6 @@ def build_rag_agent_graph():
     # 그래프 빌더 초기화
     graph_builder = StateGraph(AgentState)
     
-    # 초기 상태 설정
-    graph_builder.set_initial_state({
-        "messages": [],
-        "intermediate_steps": [],
-        "retrieved_documents": None,
-        "query_analysis": None
-    })
-    
     # 노드 추가
     graph_builder.add_node("query_analysis", query_analysis_node)
     graph_builder.add_node("router", router_node)
@@ -388,7 +380,7 @@ def build_rag_agent_graph():
     graph_builder.add_edge("query_analysis", "router")
     graph_builder.add_conditional_edges(
         "router",
-        lambda state: state.get("next"),
+        lambda x: x["route"],  # state.get("next") 대신 x["route"] 사용
         {"rag_retrieval": "rag_retrieval"}
     )
     graph_builder.add_edge("rag_retrieval", "agent")
@@ -469,8 +461,8 @@ if __name__ == "__main__":
         initial_state = {
             "messages": [HumanMessage(content=user_query)],
             "intermediate_steps": [],
-            "retrieved_documents": None,
-            "query_analysis": None
+            "retrieved_documents": [],
+            "query_analysis": {}
         }
         
         print("\n--- 그래프 실행 시작 ---")

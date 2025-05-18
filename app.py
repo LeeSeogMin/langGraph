@@ -117,8 +117,8 @@ def send_message(query: str):
         initial_state = {
             "messages": [HumanMessage(content=query)],
             "intermediate_steps": [],
-            "retrieved_documents": None,
-            "query_analysis": None
+            "retrieved_documents": [],  # None 대신 빈 리스트로 초기화
+            "query_analysis": {}  # None 대신 빈 딕셔너리로 초기화
         }
         
         # 에이전트 그래프 실행
